@@ -1213,26 +1213,63 @@ class Agent(BaseAgent):
             raise RuntimeError(f"Failed to get native MCP tools: {e}") from e
 
     def _get_amp_mcp_tools(self, amp_ref: str) -> list[BaseTool]:
-        """Get tools from CrewAI AMP MCP marketplace."""
-        # Parse: "crewai-amp:mcp-name" or "crewai-amp:mcp-name#tool_name"
+        """Get tools from CrewAI AMP MCP via crewai-oauth service.
+
+        Fetches MCP server configuration with tokens injected from crewai-oauth,
+        then uses _get_native_mcp_tools to connect and discover tools.
+        """
+        # Parse: "crewai-amp:mcp-slug" or "crewai-amp:mcp-slug#tool_name"
         amp_part = amp_ref.replace("crewai-amp:", "")
         if "#" in amp_part:
-            mcp_name, specific_tool = amp_part.split("#", 1)
+            mcp_slug, specific_tool = amp_part.split("#", 1)
         else:
-            mcp_name, specific_tool = amp_part, None
+            mcp_slug, specific_tool = amp_part, None
 
-        # Call AMP API to get MCP server URLs
-        mcp_servers = self._fetch_amp_mcp_servers(mcp_name)
+        # Fetch MCP config from crewai-oauth (with tokens injected)
+        mcp_config_dict = self._fetch_amp_mcp_config(mcp_slug)
 
-        tools = []
-        for server_config in mcp_servers:
-            server_ref = server_config["url"]
-            if specific_tool:
-                server_ref += f"#{specific_tool}"
-            server_tools = self._get_external_mcp_tools(server_ref)
-            tools.extend(server_tools)
+        if not mcp_config_dict:
+            self._logger.log(
+                "warning", f"Failed to fetch MCP config for '{mcp_slug}' from crewai-oauth"
+            )
+            return []
 
-        return tools
+        # Convert dict to MCPServerConfig (MCPServerHTTP or MCPServerSSE)
+        config_type = mcp_config_dict.get("type", "http")
+
+        if config_type == "sse":
+            mcp_config = MCPServerSSE(
+                url=mcp_config_dict["url"],
+                headers=mcp_config_dict.get("headers"),
+                cache_tools_list=mcp_config_dict.get("cache_tools_list", False),
+            )
+        else:
+            mcp_config = MCPServerHTTP(
+                url=mcp_config_dict["url"],
+                headers=mcp_config_dict.get("headers"),
+                streamable=mcp_config_dict.get("streamable", True),
+                cache_tools_list=mcp_config_dict.get("cache_tools_list", False),
+            )
+
+        # Apply tool filter if specific tool requested
+        if specific_tool:
+            from crewai.mcp.filters import create_static_tool_filter
+
+            mcp_config.tool_filter = create_static_tool_filter(
+                allowed_tool_names=[specific_tool]
+            )
+
+        # Use native MCP tools to connect and discover tools
+        try:
+            tools, client = self._get_native_mcp_tools(mcp_config)
+            if client:
+                self._mcp_clients.append(client)
+            return tools
+        except Exception as e:
+            self._logger.log(
+                "warning", f"Failed to get MCP tools from '{mcp_slug}': {e}"
+            )
+            return []
 
     @staticmethod
     def _extract_server_name(server_url: str) -> str:
@@ -1466,12 +1503,60 @@ class Agent(BaseAgent):
 
         return type_mapping.get(json_type, Any)
 
-    @staticmethod
-    def _fetch_amp_mcp_servers(mcp_name: str) -> list[dict[str, Any]]:
-        """Fetch MCP server configurations from CrewAI AMP API."""
-        # TODO: Implement AMP API call to "integrations/mcps" endpoint
-        # Should return list of server configs with URLs
-        return []
+    def _fetch_amp_mcp_config(self, mcp_slug: str) -> dict[str, Any] | None:
+        """Fetch MCP server configuration from crewai-oauth service.
+
+        Returns MCPServerConfig dict with tokens injected, ready for use with
+        _get_native_mcp_tools.
+
+        Environment variables:
+            CREWAI_OAUTH_URL: Base URL of crewai-oauth service
+            CREWAI_OAUTH_API_KEY: API key for authenticating with crewai-oauth
+
+        Args:
+            mcp_slug: The MCP server slug (e.g., "notion-mcp-abc123")
+
+        Returns:
+            Dict with type, url, headers, streamable, cache_tools_list, or None if failed.
+        """
+        import os
+
+        import requests
+
+        try:
+            endpoint = f"http://localhost:8787/mcp/me/{mcp_slug}/config"
+            response = requests.get(
+                endpoint,
+                headers={"Authorization": "Bearer 6b327f9ebe62726590f8de8f624cf018ad4765fecb7373f9db475a940ad546d0"},
+                timeout=30,
+            )
+
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 400:
+                error_data = response.json()
+                self._logger.log(
+                    "warning",
+                    f"MCP '{mcp_slug}' is not connected: {error_data.get('error_description', 'Unknown error')}",
+                )
+                return None
+            elif response.status_code == 404:
+                self._logger.log(
+                    "warning", f"MCP server '{mcp_slug}' not found in crewai-oauth"
+                )
+                return None
+            else:
+                self._logger.log(
+                    "warning",
+                    f"Failed to fetch MCP config from crewai-oauth: HTTP {response.status_code}",
+                )
+                return None
+
+        except requests.exceptions.RequestException as e:
+            self._logger.log(
+                "warning", f"Failed to connect to crewai-oauth: {e}"
+            )
+            return None
 
     @staticmethod
     def get_multimodal_tools() -> Sequence[BaseTool]:
