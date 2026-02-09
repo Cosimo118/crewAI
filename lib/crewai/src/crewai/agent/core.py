@@ -1467,7 +1467,7 @@ class Agent(BaseAgent):
         import requests
 
         try:
-            endpoint = f"http://localhost:8787/mcp/me/{mcp_slug}/config"
+            endpoint = f"http://localhost:8787/mcps/{mcp_slug}/config"
             response = requests.get(
                 endpoint,
                 headers={"Authorization": "Bearer 6b327f9ebe62726590f8de8f624cf018ad4765fecb7373f9db475a940ad546d0"},
